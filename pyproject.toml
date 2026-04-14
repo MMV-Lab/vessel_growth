@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "regiongrow"
+version = "0.1.0"
+description = "A napari plugin for 3D vessel segmentation using region growing"
+requires-python = ">=3.9"
+license = "BSD-3-Clause"
+dependencies = [
+    "napari[all]",
+    "numpy",
+    "scipy",
+    "scikit-image",
+    "magicgui",
+    "qtpy",
+]
+
+[project.entry-points."napari.manifest"]
+regiongrow = "regiongrow:napari.yaml"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+regiongrow = ["napari.yaml"]

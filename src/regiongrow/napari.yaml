@@ -1,0 +1,17 @@
+name: regiongrow
+display_name: Region Grow Vessel Segmentation
+contributions:
+  commands:
+    - id: regiongrow.make_widget
+      python_name: regiongrow._widget:RegionGrowWidget
+      title: Region Grow Vessel Segmentation
+    - id: regiongrow.sample_data
+      python_name: regiongrow._sample_data:make_sample_vessel
+      title: Synthetic Hollow Vessel
+  widgets:
+    - command: regiongrow.make_widget
+      display_name: Region Grow Vessel Segmentation
+  sample_data:
+    - command: regiongrow.sample_data
+      display_name: Synthetic Hollow Vessel
+      key: synthetic-hollow-vessel
