@@ -193,7 +193,7 @@ These controls live under **Layers** in the plugin dock. They govern **how much 
 ## Step-by-step (detailed)
 
 1. Open napari. Open the widget: **Plugins → Hollow Vessel Branch Segmentation**.
-2. Load a 3D image (single channel, shape Z×Y×X). For **OME-Zarr**, install **napari-ome-zarr** and open the `.ome.zarr` directory.
+2. Load a 3D image (single channel, shape Z×Y×X). For **OME-Zarr**, install **napari-ome-zarr** and open the `.ome.zarr` directory. The plugin checks the selected image when you open data or pick a layer: multi-channel Zarr (several `C:0`, `C:1`, … layers or more than three dimensions) shows a warning and disables **Compute Branch** until you use a single-channel volume.
 3. Select the image in **Layers → Image**. Selecting an image creates an empty **`Segmentation`** mask on that grid when none exists yet (you can also use **New Mask**).
 4. Under **Segmentation**, use **Segmentation mask** to choose the labels layer that receives **Merge Branch** and supplies context during grow (union with the preview). Use **New Mask** for additional empty masks. An **empty** mask is valid for the **first** segment.
 5. **New BranchPoints Layer** adds a new points layer (**BranchPoints_2**, …). **Reset branch points** clears the layer currently selected in **Branch points layer** (not only the default **BranchPoints** name). Optionally use **Blocker mask (optional)** / **New Blocker** to paint walls on the same pyramid grid as the image (whole-organ leakage).

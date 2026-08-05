@@ -82,6 +82,13 @@ from ._grow_roi import (
     polyline_to_roi_local,
     roi_shape_from_slices,
 )
+from ._image_validation import (
+    count_channel_split_image_layers,
+    has_blocking_validation_issues,
+    looks_like_channel_layer_name,
+    summarize_validation_issues,
+    validate_image_layer,
+)
 
 # Rough RAM cap before Grow (float32 image + masks).
 _MAX_MATERIALIZE_GB = 12.0
@@ -759,6 +766,7 @@ class HolvessegWidget(QWidget):
         self._refresh_layers_timer.setInterval(50)
         self._refresh_layers_timer.timeout.connect(self._refresh_layers_now)
         self._forced_3d_proxy_pinned: Optional[str] = None
+        self._validation_dialog_keys: set[str] = set()
 
         self._build_ui()
         self._sync_save_combined_gif_button()
@@ -768,6 +776,7 @@ class HolvessegWidget(QWidget):
         )
         self._refresh_layers_now()
         self._on_ndisplay_changed()
+        self._update_image_validation_ui(show_dialog=True)
         _init_img = self._get_image_layer()
         if _init_img is not None:
             self._ensure_default_segmentation_mask_for_image(_init_img, select=True)
@@ -1319,8 +1328,7 @@ class HolvessegWidget(QWidget):
 
     @staticmethod
     def _looks_like_channel_layer_name(name: str) -> bool:
-        # Common names from napari-ome-zarr / bioformats-like readers.
-        return bool(re.match(r"^C:\d+(\[\d+\])?$", str(name).strip()))
+        return looks_like_channel_layer_name(name)
 
     def _suggest_image_layer_name(self, layer: Any) -> Optional[str]:
         """Suggest a nicer name than 'C:0' using metadata/source when available."""
@@ -1436,7 +1444,11 @@ class HolvessegWidget(QWidget):
             ):
                 self._schedule_pyramid_dims_navigation()
         if layer is not None and isinstance(layer, napari.layers.Image):
-            if self._looks_like_channel_layer_name(layer.name):
+            channel_split_count = count_channel_split_image_layers(
+                list(self.viewer.layers)
+            )
+            was_channel_layer = self._looks_like_channel_layer_name(layer.name)
+            if was_channel_layer:
                 sug = self._suggest_image_layer_name(layer)
                 if sug:
                     new_name = self._unique_layer_name(sug)
@@ -1444,6 +1456,16 @@ class HolvessegWidget(QWidget):
                         layer.name = new_name
                     except Exception:
                         pass
+            if was_channel_layer and channel_split_count > 1:
+                QTimer.singleShot(
+                    0,
+                    lambda: self._update_image_validation_ui(show_dialog=True),
+                )
+            elif not was_channel_layer:
+                QTimer.singleShot(
+                    0,
+                    lambda: self._update_image_validation_ui(show_dialog=False),
+                )
         self._refresh_layers()
 
     def _on_layer_removed(self, event=None) -> None:
@@ -1540,6 +1562,15 @@ class HolvessegWidget(QWidget):
 
         self.image_combo = QComboBox()
         layer_form.addRow("Image:", _row(self.image_combo))
+
+        self._image_validation_label = QLabel("")
+        self._image_validation_label.setWordWrap(True)
+        self._image_validation_label.setVisible(False)
+        self._image_validation_label.setMaximumWidth(_DOCK_CONTENT_MAX_WIDTH - 8)
+        self._image_validation_label.setStyleSheet(
+            "color: #b45309; font-weight: bold; padding: 2px 0;"
+        )
+        layer_form.addRow(self._image_validation_label)
 
         self.ms_level_combo = QComboBox()
         self.ms_level_combo.setToolTip(
@@ -2386,6 +2417,7 @@ class HolvessegWidget(QWidget):
         self._update_pyramid_display_layers()
         self._apply_pyramid_dims_navigation()
         self._apply_dock_layout_constraints()
+        self._update_image_validation_ui(show_dialog=False)
         if not self.ms_level_combo.isVisible() or self.ms_level_combo.count() == 0:
             return
         if getattr(self, "_active_branch_job", None):
@@ -2753,9 +2785,55 @@ class HolvessegWidget(QWidget):
         self._sync_branch_point_bases_from_image()
         self._update_pyramid_display_layers()
         self._update_save_target_combo_state()
+        self._update_image_validation_ui(show_dialog=True)
         img = self._get_image_layer()
         if img is not None:
             self._ensure_default_segmentation_mask_for_image(img, select=True)
+
+    def _collect_image_validation_issues(self) -> List[Any]:
+        img = self._get_image_layer()
+        store_path = self._infer_omezarr_store_path(img) if img is not None else None
+        store_channels: Optional[int] = None
+        if store_path is not None:
+            from ._omezarr_reader import omzarr_store_channel_count
+
+            store_channels = omzarr_store_channel_count(store_path)
+        return validate_image_layer(
+            img,
+            pyramid_level=int(self._selected_pyramid_level()),
+            channel_split_layer_count=count_channel_split_image_layers(
+                list(self.viewer.layers)
+            ),
+            omzarr_store_channels=store_channels,
+        )
+
+    def _update_image_validation_ui(self, *, show_dialog: bool = False) -> None:
+        """Show inline warnings and optionally a one-time dialog for blocking issues."""
+        issues = self._collect_image_validation_issues()
+        blocking = has_blocking_validation_issues(issues)
+        msg = summarize_validation_issues(issues)
+        lbl = getattr(self, "_image_validation_label", None)
+        if lbl is not None:
+            if msg:
+                lbl.setText(msg)
+                lbl.setVisible(True)
+            else:
+                lbl.clear()
+                lbl.setVisible(False)
+        grow_btn = getattr(self, "btn_grow_branches", None)
+        if grow_btn is not None and getattr(self, "_active_branch_job", None) is None:
+            grow_btn.setEnabled(not blocking)
+        if show_dialog and blocking and issues:
+            key = f"{self._selected_image_layer_name()}:{issues[0].code}"
+            if key not in self._validation_dialog_keys:
+                self._validation_dialog_keys.add(key)
+                QMessageBox.warning(
+                    self,
+                    "Image not ready for segmentation",
+                    msg
+                    + "\n\nCompute Branch stays disabled until you load a "
+                    "single-channel 3D volume (Z×Y×X). See the README preprocessing section.",
+                )
 
     def _refresh_layers(self, event=None) -> None:
         """Debounced layer-list sync (combos only — not pyramid display proxies)."""
@@ -2808,6 +2886,7 @@ class HolvessegWidget(QWidget):
             self._remove_forced_2d_display_layer(restore_display=False)
             self._remove_forced_3d_display_layer(restore_display=False)
         self._apply_dock_layout_constraints()
+        self._update_image_validation_ui(show_dialog=False)
 
     def _prune_empty_archived_draft_layers(self) -> None:
         """Drop empty ``Draft_Branch (N)`` layers left over from archived previews."""
@@ -4844,6 +4923,13 @@ class HolvessegWidget(QWidget):
     def _grow_branches_into_result(self):
         image_layer = self._get_image_layer()
         if image_layer is None:
+            return
+
+        validation_issues = self._collect_image_validation_issues()
+        if has_blocking_validation_issues(validation_issues):
+            msg = summarize_validation_issues(validation_issues)
+            self.status_label.setText(msg)
+            self._update_image_validation_ui(show_dialog=True)
             return
 
         branch_name = self.branch_combo.currentText()

@@ -137,6 +137,68 @@ def _path_if_under_omezarr(uri: str) -> Optional[Path]:
 _ZARR_IO_ERRORS = (KeyError, ValueError, OSError, FileNotFoundError)
 
 
+def omzarr_store_channel_count(store: str | Path) -> Optional[int]:
+    """Return the channel count declared in an OME-Zarr store, if any."""
+    import zarr
+
+    path = resolve_omezarr_store_root(Path(store))
+    try:
+        root = zarr.open_group(str(path), mode="r")
+    except _ZARR_IO_ERRORS:
+        return None
+
+    def _from_block(block: Any) -> Optional[int]:
+        if not isinstance(block, dict):
+            return None
+        chn = block.get("channel_names")
+        if isinstance(chn, list) and len(chn) > 1:
+            return len(chn)
+        axes = block.get("axes")
+        names: List[str] = []
+        if isinstance(axes, list):
+            for entry in axes:
+                if isinstance(entry, dict):
+                    names.append(str(entry.get("name", "")).lower())
+                elif isinstance(entry, str):
+                    names.append(entry.lower())
+        if "c" not in names:
+            return None
+        datasets = block.get("datasets")
+        if not isinstance(datasets, list) or not datasets:
+            return None
+        d0 = datasets[0]
+        if not isinstance(d0, dict):
+            return None
+        rel = d0.get("path")
+        if not isinstance(rel, str) or not rel.strip():
+            return None
+        try:
+            arr = root[rel.strip("/")]
+            shp = tuple(int(x) for x in arr.shape)
+        except _ZARR_IO_ERRORS:
+            return None
+        if len(names) != len(shp):
+            return None
+        return int(shp[names.index("c")])
+
+    for key in ("multiscales",):
+        blocks = root.attrs.get(key)
+        if isinstance(blocks, list):
+            for block in blocks:
+                n = _from_block(block)
+                if n is not None and n > 1:
+                    return n
+    ome = root.attrs.get("ome")
+    if isinstance(ome, dict):
+        ms = ome.get("multiscales")
+        if isinstance(ms, list):
+            for block in ms:
+                n = _from_block(block)
+                if n is not None and n > 1:
+                    return n
+    return None
+
+
 def _array_has_foreground_chunked(a0: Any) -> bool:
     """True if any voxel of zarr array *a0* is > 0, scanning in bounded slabs.
 
@@ -633,6 +695,10 @@ def load_latest_saved_labels_layerdata(store: str | Path) -> Optional[LayerDataT
 
 def read_omezarr_image(path: str | Path) -> List[LayerDataTuple]:
     """Return only the main image pyramid from an OME-Zarr store."""
+    import warnings
+
+    from holvesseg._image_validation import warn_if_multichannel_omezarr
+
     path = resolve_omezarr_store_root(Path(path))
     from ome_zarr.io import ZarrLocation
     from ome_zarr.reader import Reader
@@ -647,6 +713,14 @@ def read_omezarr_image(path: str | Path) -> List[LayerDataTuple]:
         idata, imeta = _napari_sort_multiscale_list(
             list(image_node.data), dict(image_node.metadata or {})
         )
+        finest_arr = idata[0] if isinstance(idata, list) and idata else idata
+        finest_shape = tuple(int(x) for x in getattr(finest_arr, "shape", ()))
+        warn_msg = warn_if_multichannel_omezarr(
+            imeta, finest_shape, path_label=path.name
+        )
+        if warn_msg:
+            warnings.warn(warn_msg, stacklevel=2)
+
         layer_kw: Dict[str, Any] = {"name": name, "metadata": imeta}
         from holvesseg._volume_utils import ngff_finest_voxel_spacing_zyx
 
