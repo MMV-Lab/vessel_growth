@@ -396,8 +396,6 @@ class MorphometricsWidget(QWidget):
             size=0,
             features=labels_df,
             text={"string": "{label}", "color": "cyan", "anchor": "center"},
-            face_color="transparent",
-            edge_color="transparent",
             visible=False,
         )
 
@@ -444,8 +442,6 @@ class MorphometricsWidget(QWidget):
             size=0,
             features=labels_df,
             text={"string": "{label}", "color": "orange", "anchor": "center"},
-            face_color="transparent",
-            edge_color="transparent",
             visible=False,
         )
 
