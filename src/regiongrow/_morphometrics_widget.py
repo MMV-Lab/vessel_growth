@@ -14,21 +14,37 @@ Segments are drawn as straight lines between their start/end skeleton nodes
 possibly-curved voxel path) -- the full true skeleton is still shown as an
 always-on reference layer underneath, so this is a labelled overlay on top of
 the real geometry, not a replacement for it.
+
+Branch angles are NOT shown as a single per-segment value (a branch point
+with N segments has up to N*(N-1)/2 meaningful pairwise angles, not one) --
+instead every pairwise angle between segments meeting at a branch point is
+drawn geometrically, as an arc between the two segment directions at the
+branch point itself, with the degree value labelled on the arc.
+
+TODO (needs a vessel_analysis_3d pipeline change, not just this widget):
+"precise diameter along the branch" at a user-chosen step size is not yet
+possible. The current CSV only stores one aggregate mean/min/max diameter per
+whole segment, not a per-position profile -- the underlying per-voxel radius
+values exist transiently during the pipeline run (GraphObj.radiusMatrix +
+Filament._getSegment's full node list) but are never exported. Doing this
+properly needs a new pipeline export (e.g. a per-segment path + per-point
+radius file) before this widget can show it. The step-size control below is
+present but disabled until that export exists.
 """
 
 from __future__ import annotations
 
 import ast
-import re
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 import tifffile
-from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -44,7 +60,31 @@ from qtpy.QtWidgets import (
 
 import napari
 
-COLORABLE_PROPERTIES = ["diameter", "length", "branchingAngle", "straightness"]
+# branchingAngle intentionally excluded: it is one value per segment (the
+# angle vs. whichever neighbor the DFS happened to pick as predecessor), not
+# a real per-junction quantity when a branch point has more than 2 segments.
+# See the angle-arc layer below for the actual, geometrically-correct
+# per-pair angles.
+COLORABLE_PROPERTIES = [
+    "diameter",
+    "minDiameter",
+    "maxDiameter",
+    "length",
+    "straightness",
+    "volume",
+    "surfaceArea",
+]
+
+TABLE_COLUMNS = [
+    ("show", None),
+    ("segment", None),
+    ("diameter", "diameter"),
+    ("min", "minDiameter"),
+    ("max", "maxDiameter"),
+    ("length", "length"),
+    ("straightness", "straightness"),
+    ("filament", "filamentID"),
+]
 
 
 def _find_basename(folder: Path) -> str:
@@ -88,6 +128,65 @@ def _load_results(folder: Path) -> dict:
     }
 
 
+def _slerp(u1: np.ndarray, u2: np.ndarray, t: float, omega: float) -> np.ndarray:
+    if omega < 1e-6:
+        return u1
+    return (np.sin((1 - t) * omega) * u1 + np.sin(t * omega) * u2) / np.sin(omega)
+
+
+def _compute_branch_angles(seg_stats: pd.DataFrame, n_arc_points: int = 12) -> list[dict]:
+    """For every branch point, compute the angle between every pair of
+    segments meeting there, plus a 3D arc (via slerp between the two segment
+    directions) to draw it at the branch point itself -- the "angle between
+    two rays at a vertex" a geometry-class diagram would draw, done in 3D.
+
+    Segment direction is approximated as the straight line from the branch
+    point to the segment's far endpoint (same approximation the "segments"
+    Shapes layer already uses for the segment geometry itself).
+    """
+    node_far_ends = defaultdict(list)
+    for _, row in seg_stats.iterrows():
+        node_far_ends[row["_start"]].append(row["_end"])
+        node_far_ends[row["_end"]].append(row["_start"])
+
+    results = []
+    for node, far_ends in node_far_ends.items():
+        if len(far_ends) < 2:
+            continue
+        node_arr = np.array(node, dtype=float)
+        dirs, lens = [], []
+        for far in far_ends:
+            v = np.array(far, dtype=float) - node_arr
+            norm = np.linalg.norm(v)
+            if norm < 1e-9:
+                continue
+            dirs.append(v / norm)
+            lens.append(norm)
+
+        for i in range(len(dirs)):
+            for j in range(i + 1, len(dirs)):
+                u1, u2 = dirs[i], dirs[j]
+                cos_a = float(np.clip(np.dot(u1, u2), -1.0, 1.0))
+                angle_deg = float(np.degrees(np.arccos(cos_a)))
+                omega = float(np.arccos(cos_a))
+                # keep the arc well inside the shorter of the two segments
+                arc_radius = max(1.0, 0.25 * min(lens[i], lens[j]))
+                ts = np.linspace(0.0, 1.0, n_arc_points)
+                arc_points = np.array(
+                    [node_arr + arc_radius * _slerp(u1, u2, t, omega) for t in ts]
+                )
+                label_pos = node_arr + 1.15 * arc_radius * _slerp(u1, u2, 0.5, omega)
+                results.append(
+                    {
+                        "branch_point": node,
+                        "angle_deg": angle_deg,
+                        "arc_points": arc_points,
+                        "label_pos": label_pos,
+                    }
+                )
+    return results
+
+
 class MorphometricsWidget(QWidget):
     """Widget for viewing vessel_analysis_3d morphometrics results with toggling."""
 
@@ -100,6 +199,9 @@ class MorphometricsWidget(QWidget):
         self._segmentation_layer = None
         self._branch_pts_layer = None
         self._end_pts_layer = None
+        self._diameter_labels_layer = None
+        self._angle_arcs_layer = None
+        self._angle_labels_layer = None
 
         outer = QVBoxLayout()
         self.setLayout(outer)
@@ -119,26 +221,30 @@ class MorphometricsWidget(QWidget):
         layers_layout = QVBoxLayout()
         layers_box.setLayout(layers_layout)
         self._layer_checkboxes: dict[str, QCheckBox] = {}
-        for key, label in [
-            ("segmentation", "Raw segmentation"),
-            ("skeleton", "Full skeleton (reference)"),
-            ("segments", "Segments (toggleable)"),
-            ("branch_points", "Branch points"),
-            ("end_points", "End points"),
+        for key, label, default_on in [
+            ("segmentation", "Raw segmentation", True),
+            ("skeleton", "Full skeleton (reference)", True),
+            ("segments", "Segments (toggleable)", True),
+            ("branch_points", "Branch points", True),
+            ("end_points", "End points", True),
+            ("diameter_labels", "Diameter labels", False),
+            ("angles", "Branch angles (geometric)", False),
         ]:
             cb = QCheckBox(label)
-            cb.setChecked(True)
+            cb.setChecked(default_on)
             cb.stateChanged.connect(self._on_layer_toggle)
             self._layer_checkboxes[key] = cb
             layers_layout.addWidget(cb)
+
+        self._diameter_show_range = QCheckBox("  include min/max in diameter labels")
+        self._diameter_show_range.setChecked(False)
+        self._diameter_show_range.stateChanged.connect(self._refresh_diameter_labels)
+        layers_layout.addWidget(self._diameter_show_range)
         outer.addWidget(layers_box)
 
         filter_box = QGroupBox("Segment filter (updates 'Segments' layer live)")
         filter_layout = QFormLayout()
         filter_box.setLayout(filter_layout)
-
-        self._color_by = None
-        from qtpy.QtWidgets import QComboBox
 
         self._color_by = QComboBox()
         self._color_by.addItems(COLORABLE_PROPERTIES)
@@ -157,11 +263,35 @@ class MorphometricsWidget(QWidget):
 
         outer.addWidget(filter_box)
 
-        self._table = QTableWidget()
-        self._table.setColumnCount(6)
-        self._table.setHorizontalHeaderLabels(
-            ["show", "segment", "diameter", "length", "angle", "filament"]
+        # TODO: disabled until vessel_analysis_3d exports a per-segment path +
+        # per-point radius profile -- see module docstring.
+        profile_box = QGroupBox("Precise diameter along branch (not yet available)")
+        profile_layout = QFormLayout()
+        profile_box.setLayout(profile_layout)
+        self._step_size = QDoubleSpinBox()
+        self._step_size.setRange(0.1, 1e4)
+        self._step_size.setValue(10.0)
+        self._step_size.setEnabled(False)
+        self._step_size.setToolTip(
+            "Requires vessel_analysis_3d to export a per-segment voxel path "
+            "with per-point radius; only aggregate mean/min/max diameter per "
+            "segment is available today. Tracked as a follow-up."
         )
+        profile_layout.addRow("Step size (um)", self._step_size)
+        outer.addWidget(profile_box)
+
+        select_row = QHBoxLayout()
+        self._select_all_btn = QPushButton("Select all")
+        self._select_all_btn.clicked.connect(lambda: self._set_all_rows_checked(True))
+        self._deselect_all_btn = QPushButton("Deselect all")
+        self._deselect_all_btn.clicked.connect(lambda: self._set_all_rows_checked(False))
+        select_row.addWidget(self._select_all_btn)
+        select_row.addWidget(self._deselect_all_btn)
+        outer.addLayout(select_row)
+
+        self._table = QTableWidget()
+        self._table.setColumnCount(len(TABLE_COLUMNS))
+        self._table.setHorizontalHeaderLabels([label for label, _ in TABLE_COLUMNS])
         self._table.itemSelectionChanged.connect(self._on_table_row_selected)
         outer.addWidget(self._table)
 
@@ -179,6 +309,7 @@ class MorphometricsWidget(QWidget):
         self._populate_summary()
         self._populate_table()
         self._apply_filters()
+        self._on_layer_toggle()
 
     # ------------------------------------------------------------------
     def _build_layers(self):
@@ -219,6 +350,75 @@ class MorphometricsWidget(QWidget):
                 features=features,
                 edge_width=3,
             )
+            self._build_diameter_labels(seg_stats)
+            self._build_angle_layers(seg_stats)
+
+    def _build_diameter_labels(self, seg_stats: pd.DataFrame):
+        midpoints = np.array(
+            [
+                (np.array(r["_start"], dtype=float) + np.array(r["_end"], dtype=float)) / 2
+                for _, r in seg_stats.iterrows()
+            ]
+        )
+        labels_df = pd.DataFrame({"label": self._format_diameter_labels(seg_stats)})
+        self._diameter_labels_layer = self.viewer.add_points(
+            midpoints,
+            name=f"{self._data['basename']} diameter labels",
+            size=0,
+            features=labels_df,
+            text={"string": "{label}", "color": "cyan", "anchor": "center"},
+            face_color="transparent",
+            edge_color="transparent",
+            visible=False,
+        )
+
+    def _format_diameter_labels(self, seg_stats: pd.DataFrame) -> list[str]:
+        show_range = self._diameter_show_range.isChecked()
+        labels = []
+        for _, r in seg_stats.iterrows():
+            diameter = r.get("diameter", float("nan"))
+            if show_range and "minDiameter" in seg_stats.columns and "maxDiameter" in seg_stats.columns:
+                labels.append(
+                    f"{diameter:.1f} um ({r['minDiameter']:.1f}-{r['maxDiameter']:.1f})"
+                )
+            else:
+                labels.append(f"{diameter:.1f} um")
+        return labels
+
+    def _refresh_diameter_labels(self):
+        if self._diameter_labels_layer is None or self._data.get("segment_stats") is None:
+            return
+        seg_stats = self._data["segment_stats"]
+        self._diameter_labels_layer.features = pd.DataFrame(
+            {"label": self._format_diameter_labels(seg_stats)}
+        )
+        self._diameter_labels_layer.refresh_text()
+
+    def _build_angle_layers(self, seg_stats: pd.DataFrame):
+        angles = _compute_branch_angles(seg_stats)
+        if not angles:
+            return
+        arcs = [a["arc_points"] for a in angles]
+        self._angle_arcs_layer = self.viewer.add_shapes(
+            arcs,
+            shape_type="path",
+            name=f"{self._data['basename']} branch angles (arcs)",
+            edge_color="orange",
+            edge_width=1,
+            visible=False,
+        )
+        label_pos = np.array([a["label_pos"] for a in angles])
+        labels_df = pd.DataFrame({"label": [f"{a['angle_deg']:.1f}deg" for a in angles]})
+        self._angle_labels_layer = self.viewer.add_points(
+            label_pos,
+            name=f"{self._data['basename']} branch angles (labels)",
+            size=0,
+            features=labels_df,
+            text={"string": "{label}", "color": "orange", "anchor": "center"},
+            face_color="transparent",
+            edge_color="transparent",
+            visible=False,
+        )
 
     def _populate_summary(self):
         while self._summary_layout.rowCount():
@@ -247,12 +447,21 @@ class MorphometricsWidget(QWidget):
             self._table.setCellWidget(i, 0, cb)
             short_id = f"{row['_start']} -> {row['_end']}"
             self._table.setItem(i, 1, QTableWidgetItem(short_id))
-            self._table.setItem(i, 2, QTableWidgetItem(f"{row.get('diameter', float('nan')):.2f}"))
-            self._table.setItem(i, 3, QTableWidgetItem(f"{row.get('length', float('nan')):.2f}"))
-            angle = row.get("branchingAngle", "Null")
-            self._table.setItem(i, 4, QTableWidgetItem(str(angle)))
-            self._table.setItem(i, 5, QTableWidgetItem(str(row.get("filamentID", ""))))
+            for col_index, (_, key) in enumerate(TABLE_COLUMNS[2:], start=2):
+                value = row.get(key, "")
+                if isinstance(value, float):
+                    value = f"{value:.2f}"
+                self._table.setItem(i, col_index, QTableWidgetItem(str(value)))
         self._table.resizeColumnsToContents()
+
+    def _set_all_rows_checked(self, checked: bool):
+        for i in range(self._table.rowCount()):
+            cb = self._table.cellWidget(i, 0)
+            if cb is not None:
+                cb.blockSignals(True)
+                cb.setChecked(checked)
+                cb.blockSignals(False)
+        self._apply_filters()
 
     # ------------------------------------------------------------------
     def _on_layer_toggle(self):
@@ -262,10 +471,15 @@ class MorphometricsWidget(QWidget):
             "segments": self._segments_layer,
             "branch_points": self._branch_pts_layer,
             "end_points": self._end_pts_layer,
+            "diameter_labels": self._diameter_labels_layer,
         }
         for key, layer in mapping.items():
             if layer is not None:
                 layer.visible = self._layer_checkboxes[key].isChecked()
+        angles_on = self._layer_checkboxes["angles"].isChecked()
+        for layer in (self._angle_arcs_layer, self._angle_labels_layer):
+            if layer is not None:
+                layer.visible = angles_on
 
     def _apply_filters(self):
         if self._segments_layer is None or self._data.get("segment_stats") is None:
@@ -283,8 +497,8 @@ class MorphometricsWidget(QWidget):
 
         # napari Shapes layers don't support per-shape visibility directly;
         # approximate with edge width 0 (invisible) vs the normal width for
-        # filtered-out vs visible segments, and fade opacity to keep it as a
-        # "soft toggle" that preserves spatial context.
+        # filtered-out vs visible segments, keeping it a "soft toggle" that
+        # preserves spatial context.
         widths = [3 if s else 0 for s in shown]
         try:
             self._segments_layer.edge_width = widths
