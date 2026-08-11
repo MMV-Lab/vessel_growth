@@ -21,15 +21,15 @@ instead every pairwise angle between segments meeting at a branch point is
 drawn geometrically, as an arc between the two segment directions at the
 branch point itself, with the degree value labelled on the arc.
 
-TODO (needs a vessel_analysis_3d pipeline change, not just this widget):
-"precise diameter along the branch" at a user-chosen step size is not yet
-possible. The current CSV only stores one aggregate mean/min/max diameter per
-whole segment, not a per-position profile -- the underlying per-voxel radius
-values exist transiently during the pipeline run (GraphObj.radiusMatrix +
-Filament._getSegment's full node list) but are never exported. Doing this
-properly needs a new pipeline export (e.g. a per-segment path + per-point
-radius file) before this widget can show it. The step-size control below is
-present but disabled until that export exists.
+Precise diameter along a branch, at a user-chosen step size, is read from
+*_Segment_Diameter_Profiles.csv -- a long-format table (one row per skeleton
+voxel per segment) that vessel_analysis_3d now exports alongside the
+aggregate per-segment stats. Labels are placed at the segment's *real*
+skeleton coordinates (not the straight-line approximation the "segments"
+layer uses), so they hug the true, possibly-curved path. Results folders
+generated before this export existed simply won't have this file; the
+step-size control is then disabled with an explanatory tooltip instead of
+failing.
 """
 
 from __future__ import annotations
@@ -127,7 +127,27 @@ def _load_results(folder: Path) -> dict:
         "end_points": _read_tiff("end_points"),
         "segment_stats": seg_stats,
         "summary_stats": _read_csv("Summary_Statistics"),
+        "diameter_profiles": _read_csv("Segment_Diameter_Profiles"),
     }
+
+
+def _sample_profile_at_step(
+    profiles: pd.DataFrame, step_um: float
+) -> tuple[np.ndarray, list[str]]:
+    """Pick points spaced >= step_um apart (by path position) along each
+    segment's diameter profile, for labelling at a chosen density instead of
+    every single skeleton voxel."""
+    points, labels = [], []
+    for _, group in profiles.groupby(["filamentID", "segmentID"], sort=False):
+        group = group.sort_values("position_um")
+        next_target = 0.0
+        for _, row in group.iterrows():
+            if row["position_um"] < next_target:
+                continue
+            points.append([row["z"], row["y"], row["x"]])
+            labels.append(f"{row['diameter_um']:.1f} um")
+            next_target = row["position_um"] + step_um
+    return np.array(points) if points else np.empty((0, 3)), labels
 
 
 def _slerp(u1: np.ndarray, u2: np.ndarray, t: float, omega: float) -> np.ndarray:
@@ -204,6 +224,7 @@ class MorphometricsWidget(QWidget):
         self._diameter_labels_layer = None
         self._angle_arcs_layer = None
         self._angle_labels_layer = None
+        self._precise_diameter_layer = None
 
         # Everything lives inside a QScrollArea: this panel has grown a lot
         # of controls (filters, layer toggles, the segment table below all of
@@ -245,6 +266,7 @@ class MorphometricsWidget(QWidget):
             ("end_points", "End points", True),
             ("diameter_labels", "Diameter labels", False),
             ("angles", "Branch angles (geometric)", False),
+            ("precise_diameter", "Precise diameter (stepped)", False),
         ]:
             cb = QCheckBox(label)
             cb.setChecked(default_on)
@@ -279,22 +301,22 @@ class MorphometricsWidget(QWidget):
 
         outer.addWidget(filter_box)
 
-        # TODO: disabled until vessel_analysis_3d exports a per-segment path +
-        # per-point radius profile -- see module docstring.
-        profile_box = QGroupBox("Precise diameter along branch (not yet available)")
+        self._profile_box = QGroupBox("Precise diameter along branch")
         profile_layout = QFormLayout()
-        profile_box.setLayout(profile_layout)
+        self._profile_box.setLayout(profile_layout)
         self._step_size = QDoubleSpinBox()
         self._step_size.setRange(0.1, 1e4)
         self._step_size.setValue(10.0)
+        self._step_size.setSuffix(" um")
+        self._step_size.valueChanged.connect(self._refresh_precise_diameter_labels)
         self._step_size.setEnabled(False)
         self._step_size.setToolTip(
-            "Requires vessel_analysis_3d to export a per-segment voxel path "
-            "with per-point radius; only aggregate mean/min/max diameter per "
-            "segment is available today. Tracked as a follow-up."
+            "No *_Segment_Diameter_Profiles.csv in this results folder -- "
+            "load results from a vessel_analysis_3d run new enough to export "
+            "per-segment diameter profiles."
         )
-        profile_layout.addRow("Step size (um)", self._step_size)
-        outer.addWidget(profile_box)
+        profile_layout.addRow("Step size", self._step_size)
+        outer.addWidget(self._profile_box)
 
         select_row = QHBoxLayout()
         self._select_all_btn = QPushButton("Select all")
@@ -382,6 +404,17 @@ class MorphometricsWidget(QWidget):
             self._build_diameter_labels(seg_stats)
             self._build_angle_layers(seg_stats)
 
+        profiles = d.get("diameter_profiles")
+        has_profiles = profiles is not None and len(profiles) > 0
+        self._step_size.setEnabled(has_profiles)
+        self._profile_box.setTitle(
+            "Precise diameter along branch"
+            if has_profiles
+            else "Precise diameter along branch (no profile data in this folder)"
+        )
+        if has_profiles:
+            self._build_precise_diameter_labels()
+
     def _build_diameter_labels(self, seg_stats: pd.DataFrame):
         midpoints = np.array(
             [
@@ -445,6 +478,28 @@ class MorphometricsWidget(QWidget):
             visible=False,
         )
 
+    def _build_precise_diameter_labels(self):
+        profiles = self._data.get("diameter_profiles")
+        if profiles is None or len(profiles) == 0:
+            return
+        points, labels = _sample_profile_at_step(profiles, self._step_size.value())
+        labels_df = pd.DataFrame({"label": labels})
+        if self._precise_diameter_layer is not None:
+            self.viewer.layers.remove(self._precise_diameter_layer)
+        self._precise_diameter_layer = self.viewer.add_points(
+            points,
+            name=f"{self._data['basename']} precise diameter (stepped)",
+            size=0,
+            features=labels_df,
+            text={"string": "{label}", "color": "lime", "anchor": "center"},
+            visible=self._layer_checkboxes["precise_diameter"].isChecked(),
+        )
+
+    def _refresh_precise_diameter_labels(self):
+        if self._data is None or self._data.get("diameter_profiles") is None:
+            return
+        self._build_precise_diameter_labels()
+
     def _populate_summary(self):
         while self._summary_layout.rowCount():
             self._summary_layout.removeRow(0)
@@ -497,6 +552,7 @@ class MorphometricsWidget(QWidget):
             "branch_points": self._branch_pts_layer,
             "end_points": self._end_pts_layer,
             "diameter_labels": self._diameter_labels_layer,
+            "precise_diameter": self._precise_diameter_layer,
         }
         for key, layer in mapping.items():
             if layer is not None:
