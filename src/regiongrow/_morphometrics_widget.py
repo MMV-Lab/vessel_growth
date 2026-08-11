@@ -51,7 +51,9 @@ from qtpy.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -203,8 +205,22 @@ class MorphometricsWidget(QWidget):
         self._angle_arcs_layer = None
         self._angle_labels_layer = None
 
+        # Everything lives inside a QScrollArea: this panel has grown a lot
+        # of controls (filters, layer toggles, the segment table below all of
+        # them), and a napari dock panel does not auto-scroll on its own --
+        # without this, a short dock panel can push the table out of view
+        # with no way to reach it.
+        content = QWidget()
         outer = QVBoxLayout()
-        self.setLayout(outer)
+        content.setLayout(outer)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(content)
+        top_layout = QVBoxLayout()
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.addWidget(scroll)
+        self.setLayout(top_layout)
 
         load_row = QHBoxLayout()
         self._load_btn = QPushButton("Load results folder...")
@@ -293,6 +309,7 @@ class MorphometricsWidget(QWidget):
         self._table.setColumnCount(len(TABLE_COLUMNS))
         self._table.setHorizontalHeaderLabels([label for label, _ in TABLE_COLUMNS])
         self._table.itemSelectionChanged.connect(self._on_table_row_selected)
+        self._table.setMinimumHeight(200)
         outer.addWidget(self._table)
 
         outer.addStretch()
@@ -304,12 +321,24 @@ class MorphometricsWidget(QWidget):
             self.load_results(Path(folder))
 
     def load_results(self, folder: Path):
-        self._data = _load_results(folder)
-        self._build_layers()
-        self._populate_summary()
-        self._populate_table()
-        self._apply_filters()
-        self._on_layer_toggle()
+        try:
+            self._data = _load_results(folder)
+            self._build_layers()
+            self._populate_summary()
+            self._populate_table()
+            self._apply_filters()
+            self._on_layer_toggle()
+        except Exception as exc:
+            import traceback
+
+            QMessageBox.critical(
+                self,
+                "Failed to load results",
+                f"Could not fully load {folder}:\n\n{exc}\n\n"
+                "See the terminal for the full traceback.",
+            )
+            traceback.print_exc()
+            raise
 
     # ------------------------------------------------------------------
     def _build_layers(self):
