@@ -165,25 +165,31 @@ def _compute_branch_angles(seg_stats: pd.DataFrame, n_arc_points: int = 12) -> l
     Segment direction is approximated as the straight line from the branch
     point to the segment's far endpoint (same approximation the "segments"
     Shapes layer already uses for the segment geometry itself).
+
+    Each result also carries "segment_rows": the (row_index, row_index) pair
+    into `seg_stats` (in its iteration order, matching the segment table) of
+    the two segments this angle is between -- so a caller can decide this
+    angle should only be shown while both of its segments are shown.
     """
-    node_far_ends = defaultdict(list)
-    for _, row in seg_stats.iterrows():
-        node_far_ends[row["_start"]].append(row["_end"])
-        node_far_ends[row["_end"]].append(row["_start"])
+    node_far_ends = defaultdict(list)  # node -> list of (far_end, row_index)
+    for row_index, (_, row) in enumerate(seg_stats.iterrows()):
+        node_far_ends[row["_start"]].append((row["_end"], row_index))
+        node_far_ends[row["_end"]].append((row["_start"], row_index))
 
     results = []
     for node, far_ends in node_far_ends.items():
         if len(far_ends) < 2:
             continue
         node_arr = np.array(node, dtype=float)
-        dirs, lens = [], []
-        for far in far_ends:
+        dirs, lens, row_indices = [], [], []
+        for far, row_index in far_ends:
             v = np.array(far, dtype=float) - node_arr
             norm = np.linalg.norm(v)
             if norm < 1e-9:
                 continue
             dirs.append(v / norm)
             lens.append(norm)
+            row_indices.append(row_index)
 
         for i in range(len(dirs)):
             for j in range(i + 1, len(dirs)):
@@ -204,6 +210,7 @@ def _compute_branch_angles(seg_stats: pd.DataFrame, n_arc_points: int = 12) -> l
                         "angle_deg": angle_deg,
                         "arc_points": arc_points,
                         "label_pos": label_pos,
+                        "segment_rows": (row_indices[i], row_indices[j]),
                     }
                 )
     return results
@@ -224,7 +231,9 @@ class MorphometricsWidget(QWidget):
         self._diameter_labels_layer = None
         self._angle_arcs_layer = None
         self._angle_labels_layer = None
+        self._angle_segment_rows: list[tuple[int, int]] = []
         self._precise_diameter_layer = None
+        self._shown_segment_ids: Optional[set] = None
 
         # Everything lives inside a QScrollArea: this panel has grown a lot
         # of controls (filters, layer toggles, the segment table below all of
@@ -380,12 +389,20 @@ class MorphometricsWidget(QWidget):
         if d["branch_points"] is not None:
             coords = np.argwhere(d["branch_points"] > 0)
             self._branch_pts_layer = self.viewer.add_points(
-                coords, name=f"{d['basename']} branch points", size=4, face_color="red"
+                coords,
+                name=f"{d['basename']} branch points",
+                size=4,
+                face_color="red",
+                blending="translucent_no_depth",
             )
         if d["end_points"] is not None:
             coords = np.argwhere(d["end_points"] > 0)
             self._end_pts_layer = self.viewer.add_points(
-                coords, name=f"{d['basename']} end points", size=4, face_color="yellow"
+                coords,
+                name=f"{d['basename']} end points",
+                size=4,
+                face_color="yellow",
+                blending="translucent_no_depth",
             )
 
         seg_stats = d["segment_stats"]
@@ -430,6 +447,7 @@ class MorphometricsWidget(QWidget):
             features=labels_df,
             text={"string": "{label}", "color": "cyan", "anchor": "center"},
             visible=False,
+            blending="translucent_no_depth",
         )
 
     def _format_diameter_labels(self, seg_stats: pd.DataFrame) -> list[str]:
@@ -456,6 +474,7 @@ class MorphometricsWidget(QWidget):
 
     def _build_angle_layers(self, seg_stats: pd.DataFrame):
         angles = _compute_branch_angles(seg_stats)
+        self._angle_segment_rows = [a["segment_rows"] for a in angles]
         if not angles:
             return
         arcs = [a["arc_points"] for a in angles]
@@ -466,6 +485,7 @@ class MorphometricsWidget(QWidget):
             edge_color="orange",
             edge_width=1,
             visible=False,
+            blending="translucent_no_depth",
         )
         label_pos = np.array([a["label_pos"] for a in angles])
         labels_df = pd.DataFrame({"label": [f"{a['angle_deg']:.1f}deg" for a in angles]})
@@ -476,12 +496,15 @@ class MorphometricsWidget(QWidget):
             features=labels_df,
             text={"string": "{label}", "color": "orange", "anchor": "center"},
             visible=False,
+            blending="translucent_no_depth",
         )
 
     def _build_precise_diameter_labels(self):
         profiles = self._data.get("diameter_profiles")
         if profiles is None or len(profiles) == 0:
             return
+        if self._shown_segment_ids is not None and "segmentID" in profiles.columns:
+            profiles = profiles[profiles["segmentID"].isin(self._shown_segment_ids)]
         points, labels = _sample_profile_at_step(profiles, self._step_size.value())
         labels_df = pd.DataFrame({"label": labels})
         if self._precise_diameter_layer is not None:
@@ -493,6 +516,7 @@ class MorphometricsWidget(QWidget):
             features=labels_df,
             text={"string": "{label}", "color": "lime", "anchor": "center"},
             visible=self._layer_checkboxes["precise_diameter"].isChecked(),
+            blending="translucent_no_depth",
         )
 
     def _refresh_precise_diameter_labels(self):
@@ -562,19 +586,23 @@ class MorphometricsWidget(QWidget):
             if layer is not None:
                 layer.visible = angles_on
 
+    def _compute_shown_mask(self, seg_stats: pd.DataFrame) -> list:
+        min_len = self._min_length.value()
+        min_dia = self._min_diameter.value()
+        shown = []
+        for i in range(self._table.rowCount()):
+            cb = self._table.cellWidget(i, 0)
+            row_checked = cb.isChecked() if cb is not None else True
+            length_ok = seg_stats.iloc[i].get("length", 0) >= min_len
+            diameter_ok = seg_stats.iloc[i].get("diameter", 0) >= min_dia
+            shown.append(bool(row_checked and length_ok and diameter_ok))
+        return shown
+
     def _apply_filters(self):
         if self._segments_layer is None or self._data.get("segment_stats") is None:
             return
         seg_stats = self._data["segment_stats"]
-        min_len = self._min_length.value()
-        min_dia = self._min_diameter.value()
-
-        shown = []
-        for i in range(self._table.rowCount()):
-            row_checked = self._table.cellWidget(i, 0).isChecked()
-            length_ok = seg_stats.iloc[i].get("length", 0) >= min_len
-            diameter_ok = seg_stats.iloc[i].get("diameter", 0) >= min_dia
-            shown.append(row_checked and length_ok and diameter_ok)
+        shown = self._compute_shown_mask(seg_stats)
 
         # napari Shapes layers don't support per-shape visibility directly;
         # approximate with edge width 0 (invisible) vs the normal width for
@@ -593,6 +621,38 @@ class MorphometricsWidget(QWidget):
                 self._segments_layer.edge_colormap = "viridis"
             except Exception:
                 pass
+
+        # bind every label/stat layer to the same per-segment "show" state
+        # (checkbox + length/diameter filters) that drives the segments layer
+        if self._diameter_labels_layer is not None:
+            try:
+                self._diameter_labels_layer.shown = shown
+            except Exception:
+                pass
+
+        if self._angle_segment_rows:
+            angle_shown = [
+                shown[i] and shown[j] for (i, j) in self._angle_segment_rows
+            ]
+            if self._angle_arcs_layer is not None:
+                try:
+                    self._angle_arcs_layer.edge_width = [
+                        1 if s else 0 for s in angle_shown
+                    ]
+                except Exception:
+                    pass
+            if self._angle_labels_layer is not None:
+                try:
+                    self._angle_labels_layer.shown = angle_shown
+                except Exception:
+                    pass
+
+        if "segmentID" in seg_stats.columns:
+            shown_mask = np.array(shown, dtype=bool)
+            self._shown_segment_ids = set(seg_stats.loc[shown_mask, "segmentID"])
+        else:
+            self._shown_segment_ids = None
+        self._build_precise_diameter_labels()
 
     def _on_table_row_selected(self):
         if self._segments_layer is None:
