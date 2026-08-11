@@ -279,7 +279,9 @@ class MorphometricsWidget(QWidget):
         ]:
             cb = QCheckBox(label)
             cb.setChecked(default_on)
-            cb.stateChanged.connect(self._on_layer_toggle)
+            cb.stateChanged.connect(
+                lambda state, k=key: self._set_layer_visible_for_key(k, bool(state))
+            )
             self._layer_checkboxes[key] = cb
             layers_layout.addWidget(cb)
 
@@ -358,7 +360,7 @@ class MorphometricsWidget(QWidget):
             self._populate_summary()
             self._populate_table()
             self._apply_filters()
-            self._on_layer_toggle()
+            self._apply_all_layer_checkboxes()
         except Exception as exc:
             import traceback
 
@@ -568,23 +570,37 @@ class MorphometricsWidget(QWidget):
         self._apply_filters()
 
     # ------------------------------------------------------------------
-    def _on_layer_toggle(self):
-        mapping = {
-            "segmentation": self._segmentation_layer,
-            "skeleton": self._skeleton_layer,
-            "segments": self._segments_layer,
-            "branch_points": self._branch_pts_layer,
-            "end_points": self._end_pts_layer,
-            "diameter_labels": self._diameter_labels_layer,
-            "precise_diameter": self._precise_diameter_layer,
-        }
-        for key, layer in mapping.items():
+    def _layers_for_key(self, key: str) -> list:
+        if key == "angles":
+            return [self._angle_arcs_layer, self._angle_labels_layer]
+        return [
+            {
+                "segmentation": self._segmentation_layer,
+                "skeleton": self._skeleton_layer,
+                "segments": self._segments_layer,
+                "branch_points": self._branch_pts_layer,
+                "end_points": self._end_pts_layer,
+                "diameter_labels": self._diameter_labels_layer,
+                "precise_diameter": self._precise_diameter_layer,
+            }.get(key)
+        ]
+
+    def _set_layer_visible_for_key(self, key: str, visible: bool):
+        """Apply one checkbox's state to *only* its own layer(s). Deliberately
+        scoped this way: a shared handler that re-applied every checkbox to
+        every layer on every change would stomp on any layer visibility the
+        user set directly in napari's own layer list (e.g. hiding the
+        segmentation there) the next time any other checkbox changed."""
+        for layer in self._layers_for_key(key):
             if layer is not None:
-                layer.visible = self._layer_checkboxes[key].isChecked()
-        angles_on = self._layer_checkboxes["angles"].isChecked()
-        for layer in (self._angle_arcs_layer, self._angle_labels_layer):
-            if layer is not None:
-                layer.visible = angles_on
+                layer.visible = visible
+
+    def _apply_all_layer_checkboxes(self):
+        """Set every layer's initial visibility from its checkbox. Only call
+        this right after (re)building layers -- never wire it to a live
+        checkbox signal, or it reintroduces the stomping bug above."""
+        for key in self._layer_checkboxes:
+            self._set_layer_visible_for_key(key, self._layer_checkboxes[key].isChecked())
 
     def _compute_shown_mask(self, seg_stats: pd.DataFrame) -> list:
         min_len = self._min_length.value()
