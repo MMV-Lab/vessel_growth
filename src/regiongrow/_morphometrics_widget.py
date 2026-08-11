@@ -30,6 +30,18 @@ layer uses), so they hug the true, possibly-curved path. Results folders
 generated before this export existed simply won't have this file; the
 step-size control is then disabled with an explanatory tooltip instead of
 failing.
+
+vessel_analysis_3d's removeBorderEndPts option strips any true endpoint that
+touches the imaged volume's boundary from the official endpoint counts
+(Summary/Filament_Statistics) -- almost always the right call, since a
+vessel ending exactly at the crop edge is far more likely to just continue
+outside the field of view than to be a real anatomical tip, and you can't
+tell the two apart from a single volume. Rather than silently discarding
+those points, the pipeline now also exports them to
+*_border_end_points.ome.tiff, and this widget shows them as their own
+"Border-excluded end points" layer (off by default, gray) so you can
+inspect what got excluded and why, without it ever affecting the reported
+statistics or requiring a pipeline rerun to check.
 """
 
 from __future__ import annotations
@@ -125,6 +137,7 @@ def _load_results(folder: Path) -> dict:
         "skeleton_final": _read_tiff("skeleton_final"),
         "branch_points": _read_tiff("branch_points"),
         "end_points": _read_tiff("end_points"),
+        "border_end_points": _read_tiff("border_end_points"),
         "segment_stats": seg_stats,
         "summary_stats": _read_csv("Summary_Statistics"),
         "diameter_profiles": _read_csv("Segment_Diameter_Profiles"),
@@ -228,6 +241,7 @@ class MorphometricsWidget(QWidget):
         self._segmentation_layer = None
         self._branch_pts_layer = None
         self._end_pts_layer = None
+        self._border_end_pts_layer = None
         self._diameter_labels_layer = None
         self._angle_arcs_layer = None
         self._angle_labels_layer = None
@@ -273,6 +287,7 @@ class MorphometricsWidget(QWidget):
             ("segments", "Segments (toggleable)", True),
             ("branch_points", "Branch points", True),
             ("end_points", "End points", True),
+            ("border_end_points", "Border-excluded end points", False),
             ("diameter_labels", "Diameter labels", False),
             ("angles", "Branch angles (geometric)", False),
             ("precise_diameter", "Precise diameter (stepped)", False),
@@ -405,6 +420,21 @@ class MorphometricsWidget(QWidget):
                 size=4,
                 face_color="yellow",
                 blending="translucent_no_depth",
+            )
+        if d.get("border_end_points") is not None:
+            # true endpoints excluded by removeBorderEndPts (touch the
+            # volume boundary -- likely a field-of-view crop artifact, not a
+            # real vessel tip). Off by default: these are NOT part of the
+            # official endpoint counts in Summary/Filament_Statistics, this
+            # is purely "let me look at what got excluded and why".
+            coords = np.argwhere(d["border_end_points"] > 0)
+            self._border_end_pts_layer = self.viewer.add_points(
+                coords,
+                name=f"{d['basename']} border-excluded end points",
+                size=4,
+                face_color="gray",
+                blending="translucent_no_depth",
+                visible=False,
             )
 
         seg_stats = d["segment_stats"]
@@ -580,6 +610,7 @@ class MorphometricsWidget(QWidget):
                 "segments": self._segments_layer,
                 "branch_points": self._branch_pts_layer,
                 "end_points": self._end_pts_layer,
+                "border_end_points": self._border_end_pts_layer,
                 "diameter_labels": self._diameter_labels_layer,
                 "precise_diameter": self._precise_diameter_layer,
             }.get(key)
