@@ -15,6 +15,9 @@ contributions:
     - id: regiongrow.sample_data
       python_name: regiongrow._sample_data:make_sample_vessel
       title: Synthetic Hollow Vessel
+    - id: regiongrow.make_morphometrics_widget
+      python_name: regiongrow._morphometrics_widget:MorphometricsWidget
+      title: Vessel Morphometrics Viewer
   readers:
     - command: regiongrow.read_ome_tiff
       filename_patterns:
@@ -28,6 +31,8 @@ contributions:
   widgets:
     - command: regiongrow.make_widget
       display_name: Region Grow Vessel Segmentation
+    - command: regiongrow.make_morphometrics_widget
+      display_name: Vessel Morphometrics Viewer
   sample_data:
     - command: regiongrow.sample_data
       display_name: Synthetic Hollow Vessel
