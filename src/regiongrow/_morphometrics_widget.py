@@ -217,6 +217,12 @@ def _sample_profile_at_step(
 def _slerp(u1: np.ndarray, u2: np.ndarray, t: float, omega: float) -> np.ndarray:
     if omega < 1e-6:
         return u1
+    if omega > np.pi - 1e-6:
+        # u1 and u2 are antipodal: sin(omega) -> 0 here too, and there is no
+        # unique great circle between two antipodal points, so the formula
+        # below is undefined. Callers should avoid this range entirely (see
+        # _compute_branch_angles), this is a last-resort guard.
+        return u1
     return (np.sin((1 - t) * omega) * u1 + np.sin(t * omega) * u2) / np.sin(omega)
 
 
@@ -271,6 +277,16 @@ def _compute_branch_angles(seg_stats: pd.DataFrame, n_arc_points: int = 12) -> l
                     # value encountered in divide" warning on switching to
                     # 3D). Skip drawing an arc for it; the near-0deg angle
                     # itself isn't useful to visualize as a shape anyway.
+                    continue
+                if omega > np.pi - 1e-4:
+                    # the opposite extreme: two segments leaving in nearly
+                    # opposite directions are antipodal points on the unit
+                    # sphere, where sin(omega) -> 0 too. _slerp's formula is
+                    # mathematically singular there (an antipodal pair has no
+                    # unique great circle, hence no unique interpolation
+                    # path), which can produce NaN/extreme arc points -- the
+                    # same tube-rendering divide-by-zero this whole function
+                    # is written to avoid. Skip it for the same reason.
                     continue
                 # keep the arc well inside the shorter of the two segments
                 arc_radius = max(1.0, 0.25 * min(lens[i], lens[j]))
@@ -621,7 +637,13 @@ class MorphometricsWidget(QWidget):
             profiles = profiles[profiles["segmentID"].isin(self._shown_segment_ids)]
         points, labels = _sample_profile_at_step(profiles, self._step_size.value())
         labels_df = pd.DataFrame({"label": labels})
-        if self._precise_diameter_layer is not None:
+        # self._precise_diameter_layer can point at a layer that's no longer
+        # actually in the viewer -- e.g. the user removed it by hand via
+        # napari's own layer panel, or a previous load_results() call's
+        # layer wasn't cleaned up -- so removing it unconditionally can
+        # raise "<Points layer ...> is not in list" instead of just
+        # replacing it.
+        if self._precise_diameter_layer is not None and self._precise_diameter_layer in self.viewer.layers:
             self.viewer.layers.remove(self._precise_diameter_layer)
         self._precise_diameter_layer = self.viewer.add_points(
             points,
