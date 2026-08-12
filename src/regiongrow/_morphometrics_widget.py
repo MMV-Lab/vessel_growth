@@ -47,6 +47,7 @@ statistics or requiring a pipeline rerun to check.
 from __future__ import annotations
 
 import ast
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional
@@ -108,12 +109,51 @@ def _find_basename(folder: Path) -> str:
     return matches[0].name[: -len("_Segment_Statistics.csv")]
 
 
+def _read_physical_scale(path: Path) -> Optional[np.ndarray]:
+    """Read the (z, y, x) physical voxel size vessel_analysis_3d embeds in
+    each OME-TIFF it writes (processing_pipeline.py's PhysicalSizeZ/Y/X),
+    so napari can render this anisotropic data (typically ~8um Z vs ~3.5um
+    XY) at its true proportions instead of silently defaulting every layer
+    to an isotropic [1, 1, 1] scale, which visibly distorts the volume.
+    Returns None if the file has no OME metadata or is missing physical
+    size (e.g. results from a run without embedded input metadata) --
+    callers should then leave napari's isotropic default in place rather
+    than guess a scale.
+    """
+    try:
+        with tifffile.TiffFile(str(path)) as tif:
+            ome_xml = tif.ome_metadata
+    except Exception:
+        return None
+    if not ome_xml:
+        return None
+    try:
+        root = ET.fromstring(ome_xml)
+    except ET.ParseError:
+        return None
+    ns = {"ome": "http://www.openmicroscopy.org/Schemas/OME/2016-06"}
+    pixels = root.find(".//ome:Pixels", ns)
+    if pixels is None:
+        return None
+    try:
+        z = float(pixels.attrib["PhysicalSizeZ"])
+        y = float(pixels.attrib["PhysicalSizeY"])
+        x = float(pixels.attrib["PhysicalSizeX"])
+    except (KeyError, ValueError):
+        return None
+    return np.array([z, y, x])
+
+
 def _load_results(folder: Path) -> dict:
     basename = _find_basename(folder)
 
-    def _read_tiff(suffix):
+    def _tiff_path(suffix):
         path = folder / f"{basename}_{suffix}.ome.tiff"
-        return tifffile.imread(str(path)) if path.exists() else None
+        return path if path.exists() else None
+
+    def _read_tiff(suffix):
+        path = _tiff_path(suffix)
+        return tifffile.imread(str(path)) if path is not None else None
 
     def _read_csv(suffix):
         path = folder / f"{basename}_{suffix}.csv"
@@ -131,8 +171,19 @@ def _load_results(folder: Path) -> dict:
         seg_stats["_start"] = starts
         seg_stats["_end"] = ends
 
+    scale = None
+    for suffix in ("raw_segmentation", "skeleton_final", "branch_points"):
+        path = _tiff_path(suffix)
+        if path is not None:
+            scale = _read_physical_scale(path)
+            if scale is not None:
+                break
+    if scale is None:
+        scale = np.array([1.0, 1.0, 1.0])
+
     return {
         "basename": basename,
+        "scale": scale,
         "raw_segmentation": _read_tiff("raw_segmentation"),
         "skeleton_final": _read_tiff("skeleton_final"),
         "branch_points": _read_tiff("branch_points"),
@@ -210,6 +261,17 @@ def _compute_branch_angles(seg_stats: pd.DataFrame, n_arc_points: int = 12) -> l
                 cos_a = float(np.clip(np.dot(u1, u2), -1.0, 1.0))
                 angle_deg = float(np.degrees(np.arccos(cos_a)))
                 omega = float(np.arccos(cos_a))
+                if omega < 1e-4:
+                    # two segments leaving this branch point in essentially
+                    # the same direction have no meaningful arc to draw --
+                    # _slerp degenerates to a single repeated point here,
+                    # which is a zero-length path. Rendered in 3D, vispy's
+                    # tube visual normalizes each segment's tangent vector,
+                    # so a zero-length one divides by zero (the "invalid
+                    # value encountered in divide" warning on switching to
+                    # 3D). Skip drawing an arc for it; the near-0deg angle
+                    # itself isn't useful to visualize as a shape anyway.
+                    continue
                 # keep the arc well inside the shorter of the two segments
                 arc_radius = max(1.0, 0.25 * min(lens[i], lens[j]))
                 ts = np.linspace(0.0, 1.0, n_arc_points)
@@ -391,10 +453,12 @@ class MorphometricsWidget(QWidget):
     # ------------------------------------------------------------------
     def _build_layers(self):
         d = self._data
+        scale = d["scale"]
         if d["raw_segmentation"] is not None:
             self._segmentation_layer = self.viewer.add_labels(
                 (d["raw_segmentation"] > 0).astype(np.uint8),
                 name=f"{d['basename']} segmentation",
+                scale=scale,
             )
         if d["skeleton_final"] is not None:
             self._skeleton_layer = self.viewer.add_image(
@@ -402,6 +466,7 @@ class MorphometricsWidget(QWidget):
                 name=f"{d['basename']} skeleton (full)",
                 blending="additive",
                 colormap="gray",
+                scale=scale,
             )
         if d["branch_points"] is not None:
             coords = np.argwhere(d["branch_points"] > 0)
@@ -411,6 +476,7 @@ class MorphometricsWidget(QWidget):
                 size=4,
                 face_color="red",
                 blending="translucent_no_depth",
+                scale=scale,
             )
         if d["end_points"] is not None:
             coords = np.argwhere(d["end_points"] > 0)
@@ -420,6 +486,7 @@ class MorphometricsWidget(QWidget):
                 size=4,
                 face_color="yellow",
                 blending="translucent_no_depth",
+                scale=scale,
             )
         if d.get("border_end_points") is not None:
             # true endpoints excluded by removeBorderEndPts (touch the
@@ -435,12 +502,23 @@ class MorphometricsWidget(QWidget):
                 face_color="gray",
                 blending="translucent_no_depth",
                 visible=False,
+                scale=scale,
             )
 
         seg_stats = d["segment_stats"]
         if seg_stats is not None and len(seg_stats) > 0:
-            lines = [[row["_start"], row["_end"]] for _, row in seg_stats.iterrows()]
-            features = seg_stats[
+            # a zero-length line (start == end) has no well-defined
+            # direction; vispy's 3D tube rendering divides by that
+            # direction's length, so a degenerate segment can produce the
+            # "invalid value encountered in divide" warning (and a
+            # rendering glitch) the moment the viewer switches to 3D
+            lines, features_rows = [], []
+            for _, row in seg_stats.iterrows():
+                if tuple(row["_start"]) == tuple(row["_end"]):
+                    continue
+                lines.append([row["_start"], row["_end"]])
+                features_rows.append(row)
+            features = pd.DataFrame(features_rows)[
                 [c for c in COLORABLE_PROPERTIES if c in seg_stats.columns]
             ].copy()
             self._segments_layer = self.viewer.add_shapes(
@@ -449,6 +527,7 @@ class MorphometricsWidget(QWidget):
                 name=f"{d['basename']} segments",
                 features=features,
                 edge_width=3,
+                scale=scale,
             )
             self._build_diameter_labels(seg_stats)
             self._build_angle_layers(seg_stats)
@@ -480,6 +559,7 @@ class MorphometricsWidget(QWidget):
             text={"string": "{label}", "color": "cyan", "anchor": "center"},
             visible=False,
             blending="translucent_no_depth",
+            scale=self._data["scale"],
         )
 
     def _format_diameter_labels(self, seg_stats: pd.DataFrame) -> list[str]:
@@ -518,6 +598,7 @@ class MorphometricsWidget(QWidget):
             edge_width=1,
             visible=False,
             blending="translucent_no_depth",
+            scale=self._data["scale"],
         )
         label_pos = np.array([a["label_pos"] for a in angles])
         labels_df = pd.DataFrame({"label": [f"{a['angle_deg']:.1f}deg" for a in angles]})
@@ -529,6 +610,7 @@ class MorphometricsWidget(QWidget):
             text={"string": "{label}", "color": "orange", "anchor": "center"},
             visible=False,
             blending="translucent_no_depth",
+            scale=self._data["scale"],
         )
 
     def _build_precise_diameter_labels(self):
@@ -549,6 +631,7 @@ class MorphometricsWidget(QWidget):
             text={"string": "{label}", "color": "lime", "anchor": "center"},
             visible=self._layer_checkboxes["precise_diameter"].isChecked(),
             blending="translucent_no_depth",
+            scale=self._data["scale"],
         )
 
     def _refresh_precise_diameter_labels(self):
