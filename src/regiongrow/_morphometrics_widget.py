@@ -63,7 +63,6 @@ from qtpy.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QMessageBox,
@@ -74,6 +73,7 @@ from qtpy.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from superqt import QCollapsible
 
 import napari
 
@@ -334,6 +334,18 @@ def _compute_branch_angles(seg_stats: pd.DataFrame, n_arc_points: int = 12) -> l
     return results
 
 
+def _collapsible(title: str, content_layout) -> QCollapsible:
+    """A titled, collapsible section (superqt, already a napari dependency)
+    wrapping `content_layout` -- rows/widgets can still be added to
+    `content_layout` normally, before or after this call."""
+    box = QCollapsible(title)
+    content = QWidget()
+    content.setLayout(content_layout)
+    box.addWidget(content)
+    box.expand()
+    return box
+
+
 class MorphometricsWidget(QWidget):
     """Widget for viewing vessel_analysis_3d morphometrics results with toggling."""
 
@@ -343,6 +355,16 @@ class MorphometricsWidget(QWidget):
         self._data: Optional[dict] = None
         self._path_by_segment = {}
         self._segments_layer = None
+        # Cached (same lockstep row order as `shown`) so _apply_filters can
+        # rebuild the segments layer's `.data`/`.features` from the full set
+        # on every filter change -- see _apply_filters for why this replaced
+        # an edge_width=0/3 toggle (2.6s per call on real data; a .data
+        # rebuild is ~300ms). Row -> layer-shape-index map lets
+        # _on_table_row_selected keep working once the layer no longer
+        # always holds one shape per table row.
+        self._segment_lines_full: list = []
+        self._segment_features_full = None
+        self._shown_row_to_layer_index: dict[int, int] = {}
         self._skeleton_layer = None
         self._segmentation_layer = None
         self._branch_pts_layer = None
@@ -381,14 +403,26 @@ class MorphometricsWidget(QWidget):
         load_row.addWidget(self._load_btn)
         outer.addLayout(load_row)
 
-        self._summary_box = QGroupBox("Summary")
         self._summary_layout = QFormLayout()
-        self._summary_box.setLayout(self._summary_layout)
+        self._summary_box = _collapsible("Summary", self._summary_layout)
         outer.addWidget(self._summary_box)
 
-        layers_box = QGroupBox("Layers")
+        # Recomputed live in _apply_filters from just the currently-shown
+        # segments -- distinct from the "Summary" box above, which always
+        # reflects the full, unfiltered Segment_Statistics.csv (the numbers
+        # that go into the exported report). tissueVolume_mm3/
+        # vesselVolumeFraction aren't here on purpose: both come from the
+        # raw voxel mask of the whole imaged volume, not from summing
+        # segments, so there's no cheap, meaningful way to recompute them
+        # for an arbitrary subset -- they only make sense whole-dataset.
+        self._selection_summary_layout = QFormLayout()
+        self._selection_summary_box = _collapsible(
+            "Current selection", self._selection_summary_layout
+        )
+        outer.addWidget(self._selection_summary_box)
+
         layers_layout = QVBoxLayout()
-        layers_box.setLayout(layers_layout)
+        layers_box = _collapsible("Layers", layers_layout)
         self._layer_checkboxes: dict[str, QCheckBox] = {}
         for key, label, default_on in [
             ("segmentation", "Raw segmentation", True),
@@ -415,9 +449,10 @@ class MorphometricsWidget(QWidget):
         layers_layout.addWidget(self._diameter_show_range)
         outer.addWidget(layers_box)
 
-        filter_box = QGroupBox("Segment filter (updates 'Segments' layer live)")
         filter_layout = QFormLayout()
-        filter_box.setLayout(filter_layout)
+        filter_box = _collapsible(
+            "Segment filter (updates 'Segments' layer live)", filter_layout
+        )
 
         self._color_by = QComboBox()
         self._color_by.addItems(COLORABLE_PROPERTIES)
@@ -450,22 +485,25 @@ class MorphometricsWidget(QWidget):
         self._max_diameter.valueChanged.connect(self._apply_filters)
         filter_layout.addRow("Max diameter (um)", self._max_diameter)
 
-        # A segment is "boundaryClipped" (see filament.py touchesVolumeBoundary)
-        # if its own local radius reaches a face of the imaged volume anywhere
-        # along its path -- this also catches vessels that run roughly
+        # A segment is "boundaryClipped" (see GraphObj._flag_boundary_clipped_
+        # segments in core.py) if raw-mask foreground sits within
+        # boundaryClipMarginUm of both a volume face and one of the segment's
+        # own skeleton nodes -- this also catches vessels that run roughly
         # parallel/close to the crop edge and get their cross-section
         # partially clipped along their length, not just ones that terminate
-        # there. Off by default: hiding these changes what's shown, not the
-        # underlying stats/export, so it stays a deliberate opt-in.
+        # there. On by default per Simon (2026-08-21): this only changes what's
+        # shown, never the underlying stats/export (still pooled, just marked
+        # "out-of-competition" via boundaryClippedSegments/Fraction) -- so
+        # defaulting to hidden is a safe, easily-undone view choice.
         self._hide_boundary_clipped = QCheckBox("Hide boundary-clipped segments")
+        self._hide_boundary_clipped.setChecked(True)
         self._hide_boundary_clipped.stateChanged.connect(self._apply_filters)
         filter_layout.addRow(self._hide_boundary_clipped)
 
         outer.addWidget(filter_box)
 
-        self._profile_box = QGroupBox("Precise diameter along branch")
         profile_layout = QFormLayout()
-        self._profile_box.setLayout(profile_layout)
+        self._profile_box = _collapsible("Precise diameter along branch", profile_layout)
         self._step_size = QDoubleSpinBox()
         self._step_size.setRange(0.1, 1e4)
         self._step_size.setValue(10.0)
@@ -639,6 +677,8 @@ class MorphometricsWidget(QWidget):
                 edge_width=3,
                 scale=scale,
             )
+            self._segment_lines_full = lines
+            self._segment_features_full = features
             # Cached (same lockstep row order as `shown`, see
             # _compute_shown_mask) so _apply_filters can rebuild `.data`
             # from the full set on every filter change.
@@ -657,7 +697,7 @@ class MorphometricsWidget(QWidget):
             self._build_angle_layers(seg_stats)
 
         self._step_size.setEnabled(has_profiles)
-        self._profile_box.setTitle(
+        self._profile_box.setText(
             "Precise diameter along branch"
             if has_profiles
             else "Precise diameter along branch (no profile data in this folder)"
@@ -747,6 +787,21 @@ class MorphometricsWidget(QWidget):
         )
 
     def _build_precise_diameter_labels(self):
+        # POTENTIAL OPTIMIZATION (2026-08-21, not done): this is the single
+        # biggest remaining cost in _apply_filters on real data (~1.6s of
+        # its ~2.6s total, measured on segmentation_v30's 534 segments) --
+        # everything else in that function was brought down from ~5s to
+        # ~2.6s the same day by replacing an edge_width toggle with a
+        # cheaper `.data` rebuild (see that function's own comment), but
+        # this one is a different kind of cost, not a quick swap: it
+        # rebuilds this whole Points layer from scratch every call, and
+        # _sample_profile_at_step below iterates the diameter-profile
+        # table row by row via pandas .iterrows() -- one row per skeleton
+        # voxel along every segment (tens of thousands of rows total, not
+        # per-segment like everything else here). Worth vectorizing
+        # _sample_profile_at_step's per-group "pick points >= step_um
+        # apart" logic (a sequential/stateful selection, so not a trivial
+        # rewrite) if this filter lag becomes a real problem in practice.
         profiles = self._data.get("diameter_profiles")
         if profiles is None or len(profiles) == 0:
             return
@@ -792,6 +847,55 @@ class MorphometricsWidget(QWidget):
             if isinstance(value, float):
                 value = f"{value:.4g}"
             self._summary_layout.addRow(QLabel(col), QLabel(str(value)))
+
+    def _populate_selection_summary(self, seg_stats: pd.DataFrame, shown: list):
+        """Recompute the "Current selection" panel from just the segments
+        currently passing the table checkboxes + filters (see the box's own
+        docstring comment in __init__ for why tissueVolume_mm3/
+        vesselVolumeFraction aren't included here)."""
+        while self._selection_summary_layout.rowCount():
+            self._selection_summary_layout.removeRow(0)
+
+        def add(label, value):
+            text = f"{value:.4g}" if isinstance(value, float) else str(value)
+            self._selection_summary_layout.addRow(QLabel(label), QLabel(text))
+
+        subset = seg_stats.loc[np.array(shown, dtype=bool)]
+        add("segments shown", f"{len(subset)} / {len(seg_stats)}")
+        if len(subset) == 0:
+            return
+
+        if "diameter" in subset.columns:
+            add("meanDiameter_um", float(subset["diameter"].mean()))
+            add("minDiameter_um", float(subset["diameter"].min()))
+            add("maxDiameter_um", float(subset["diameter"].max()))
+        if "length" in subset.columns:
+            add("totalVesselLength_mm", float(subset["length"].sum()) / 1000.0)
+        if "surfaceArea" in subset.columns:
+            add("totalSurfaceArea_mm2", float(subset["surfaceArea"].sum()) / 1e6)
+        if "volume" in subset.columns:
+            add("totalVesselVolume_mm3", float(subset["volume"].sum()) / 1e9)
+        if "boundaryClipped" in subset.columns:
+            add("boundaryClippedSegments", int(subset["boundaryClipped"].sum()))
+
+        # Unique branch/terminal point NODES touched by the shown segments,
+        # via the branch/end-point voxel masks -- summing a per-segment
+        # "is this endpoint a branch point" flag would overcount a branch
+        # point shared by several segments meeting there.
+        branch_arr = self._data.get("branch_points")
+        end_arr = self._data.get("end_points")
+        if (branch_arr is not None or end_arr is not None) and {"_start", "_end"} <= set(
+            subset.columns
+        ):
+            branch_nodes, terminal_nodes = set(), set()
+            for _, row in subset.iterrows():
+                for pt in (tuple(row["_start"]), tuple(row["_end"])):
+                    if branch_arr is not None and branch_arr[pt] > 0:
+                        branch_nodes.add(pt)
+                    if end_arr is not None and end_arr[pt] > 0:
+                        terminal_nodes.add(pt)
+            add("totalBranchPoints", len(branch_nodes))
+            add("totalTerminalPoints", len(terminal_nodes))
 
     def _populate_table(self):
         seg_stats = self._data.get("segment_stats")
@@ -888,13 +992,38 @@ class MorphometricsWidget(QWidget):
         seg_stats = self._data["segment_stats"]
         shown = self._compute_shown_mask(seg_stats)
 
-        # napari Shapes layers don't support per-shape visibility directly;
-        # approximate with edge width 0 (invisible) vs the normal width for
-        # filtered-out vs visible segments, keeping it a "soft toggle" that
-        # preserves spatial context.
-        widths = [3 if s else 0 for s in shown]
+        # napari Shapes layers don't support per-shape visibility directly.
+        # An edge_width=0/3 toggle was tried first, but on real data (534
+        # paths, ~63 vertices each) setting edge_width -- to ANY value,
+        # scalar or per-shape array alike -- forces a full retriangulation
+        # of the whole layer: ~2.6s per call, confirmed by timing a plain
+        # `layer.edge_width = 3.0` with nothing else changed. Rebuilding
+        # `.data` from the cached full set instead only retriangulates the
+        # shapes actually kept: ~300-400ms for the same layer, regardless
+        # of subset size. `.features` must be rebuilt in lockstep by hand --
+        # confirmed napari does NOT correctly re-derive it for a
+        # non-contiguous `.data` subset (it just truncates the old
+        # `.features` to the new length, silently pairing colors with the
+        # wrong shapes), so edge_color/edge_colormap below would otherwise
+        # be quietly wrong.
         try:
-            self._segments_layer.edge_width = widths
+            visible_segments = [
+                line for line, s in zip(self._segment_lines_full, shown) if s
+            ]
+            self._segments_layer.data = visible_segments
+            if self._segment_features_full is not None:
+                shown_mask_for_features = np.array(
+                    shown[: len(self._segment_features_full)], dtype=bool
+                )
+                self._segments_layer.features = self._segment_features_full.loc[
+                    shown_mask_for_features
+                ].reset_index(drop=True)
+            self._shown_row_to_layer_index = {
+                row_idx: layer_idx
+                for layer_idx, row_idx in enumerate(
+                    i for i, s in enumerate(shown) if s
+                )
+            }
         except Exception:
             pass
         # Same shown mask, same row order (built in the same loop in
@@ -956,9 +1085,19 @@ class MorphometricsWidget(QWidget):
         else:
             self._shown_segment_ids = None
         self._build_precise_diameter_labels()
+        self._populate_selection_summary(seg_stats, shown)
 
     def _on_table_row_selected(self):
         if self._segments_layer is None:
             return
         rows = {idx.row() for idx in self._table.selectedIndexes()}
-        self._segments_layer.selected_data = rows
+        # table row index != layer shape index now that the segments layer
+        # only ever holds the currently-shown subset (see _apply_filters) --
+        # a selected row with no entry here is currently filtered out, so
+        # there's no shape to select.
+        layer_indices = {
+            self._shown_row_to_layer_index[r]
+            for r in rows
+            if r in self._shown_row_to_layer_index
+        }
+        self._segments_layer.selected_data = layer_indices
