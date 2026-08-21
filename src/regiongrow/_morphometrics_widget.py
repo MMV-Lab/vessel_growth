@@ -9,11 +9,14 @@ Deliberately decoupled from vessel_analysis_3d itself: this widget only reads
 the standard output file schema, so it works with any pipeline run producing
 that schema, without importing vessel_analysis_3d as a dependency.
 
-Segments are drawn as straight lines between their start/end skeleton nodes
-(the CSV only stores segment endpoints + aggregate stats, not the full,
-possibly-curved voxel path) -- the full true skeleton is still shown as an
-always-on reference layer underneath, so this is a labelled overlay on top of
-the real geometry, not a replacement for it.
+Segments are drawn tracing their real, possibly-curved skeleton path (read
+from *_Segment_Diameter_Profiles.csv), not a straight line between their
+start/end nodes -- on a tortuous vessel a straight line can cut across
+unrelated structure, making it visually impossible to tell which segment a
+given piece of skeleton actually belongs to. Falls back to a straight line
+for result folders generated before that export existed. The full true
+skeleton is still shown as an always-on reference layer underneath, so this
+is a labelled overlay on top of the real geometry, not a replacement for it.
 
 Branch angles are NOT shown as a single per-segment value (a branch point
 with N segments has up to N*(N-1)/2 meaningful pairwise angles, not one) --
@@ -24,12 +27,11 @@ branch point itself, with the degree value labelled on the arc.
 Precise diameter along a branch, at a user-chosen step size, is read from
 *_Segment_Diameter_Profiles.csv -- a long-format table (one row per skeleton
 voxel per segment) that vessel_analysis_3d now exports alongside the
-aggregate per-segment stats. Labels are placed at the segment's *real*
-skeleton coordinates (not the straight-line approximation the "segments"
-layer uses), so they hug the true, possibly-curved path. Results folders
-generated before this export existed simply won't have this file; the
-step-size control is then disabled with an explanatory tooltip instead of
-failing.
+aggregate per-segment stats. This is the same file the segments layer above
+traces its path from. Results folders generated before this export existed
+simply won't have this file; the step-size control and the traced-path
+segments layer both fall back gracefully (a disabled tooltip, and a
+straight-line approximation, respectively) instead of failing.
 
 vessel_analysis_3d's removeBorderEndPts option strips any true endpoint that
 touches the imaged volume's boundary from the official endpoint counts
@@ -102,11 +104,35 @@ TABLE_COLUMNS = [
 ]
 
 
-def _find_basename(folder: Path) -> str:
+def _find_basename(folder: Path) -> tuple[Path, str]:
+    """Locate the actual results folder and this run's shared file basename.
+
+    run_vessel_analysis.py always writes into a fresh timestamped
+    subfolder of the output_dir it's given (e.g.
+    output_dir/2026_08_19_21_55_40_xxxx/), never into output_dir itself --
+    but selecting the folder you just pointed the pipeline's --output-dir
+    at is the natural thing to do here, and used to fail outright with no
+    hint why. Falls back to the most recently modified immediate
+    subfolder that has a matching CSV if the selected folder itself
+    doesn't, so both "the run's own output folder" and "the output_dir
+    containing it" work.
+    """
     matches = sorted(folder.glob("*_Segment_Statistics.csv"))
-    if not matches:
-        raise FileNotFoundError(f"no *_Segment_Statistics.csv found in {folder}")
-    return matches[0].name[: -len("_Segment_Statistics.csv")]
+    if matches:
+        return folder, matches[0].name[: -len("_Segment_Statistics.csv")]
+
+    candidates = sorted(
+        folder.glob("*/*_Segment_Statistics.csv"),
+        key=lambda p: p.parent.stat().st_mtime,
+        reverse=True,
+    )
+    if candidates:
+        run_folder = candidates[0].parent
+        return run_folder, candidates[0].name[: -len("_Segment_Statistics.csv")]
+
+    raise FileNotFoundError(
+        f"no *_Segment_Statistics.csv found in {folder} or its immediate subfolders"
+    )
 
 
 def _read_physical_scale(path: Path) -> Optional[np.ndarray]:
@@ -145,7 +171,7 @@ def _read_physical_scale(path: Path) -> Optional[np.ndarray]:
 
 
 def _load_results(folder: Path) -> dict:
-    basename = _find_basename(folder)
+    folder, basename = _find_basename(folder)
 
     def _tiff_path(suffix):
         path = folder / f"{basename}_{suffix}.ome.tiff"
@@ -233,8 +259,9 @@ def _compute_branch_angles(seg_stats: pd.DataFrame, n_arc_points: int = 12) -> l
     two rays at a vertex" a geometry-class diagram would draw, done in 3D.
 
     Segment direction is approximated as the straight line from the branch
-    point to the segment's far endpoint (same approximation the "segments"
-    Shapes layer already uses for the segment geometry itself).
+    point to the segment's far endpoint -- a deliberate simplification for
+    the angle itself (the two rays meeting at the branch point), independent
+    of how the "segments" Shapes layer renders the segment's own path.
 
     Each result also carries "segment_rows": the (row_index, row_index) pair
     into `seg_stats` (in its iteration order, matching the segment table) of
@@ -314,6 +341,7 @@ class MorphometricsWidget(QWidget):
         super().__init__()
         self.viewer = napari_viewer
         self._data: Optional[dict] = None
+        self._path_by_segment = {}
         self._segments_layer = None
         self._skeleton_layer = None
         self._segmentation_layer = None
@@ -323,6 +351,9 @@ class MorphometricsWidget(QWidget):
         self._diameter_labels_layer = None
         self._angle_arcs_layer = None
         self._angle_labels_layer = None
+        self._angle_arc_points_full: list = []
+        self._straight_segments_layer = None
+        self._straight_lines_full: list = []
         self._angle_segment_rows: list[tuple[int, int]] = []
         self._precise_diameter_layer = None
         self._shown_segment_ids: Optional[set] = None
@@ -393,15 +424,42 @@ class MorphometricsWidget(QWidget):
         self._color_by.currentTextChanged.connect(self._apply_filters)
         filter_layout.addRow("Color by", self._color_by)
 
+        # Min/max default to the range's own extremes (0 and 1e6) so
+        # neither bound constrains anything until the user actually
+        # narrows it -- e.g. leaving max length at 1e6 means "no upper
+        # limit", not "hide everything longer than 1e6um".
         self._min_length = QDoubleSpinBox()
         self._min_length.setRange(0, 1e6)
         self._min_length.valueChanged.connect(self._apply_filters)
         filter_layout.addRow("Min length (um)", self._min_length)
 
+        self._max_length = QDoubleSpinBox()
+        self._max_length.setRange(0, 1e6)
+        self._max_length.setValue(1e6)
+        self._max_length.valueChanged.connect(self._apply_filters)
+        filter_layout.addRow("Max length (um)", self._max_length)
+
         self._min_diameter = QDoubleSpinBox()
         self._min_diameter.setRange(0, 1e6)
         self._min_diameter.valueChanged.connect(self._apply_filters)
         filter_layout.addRow("Min diameter (um)", self._min_diameter)
+
+        self._max_diameter = QDoubleSpinBox()
+        self._max_diameter.setRange(0, 1e6)
+        self._max_diameter.setValue(1e6)
+        self._max_diameter.valueChanged.connect(self._apply_filters)
+        filter_layout.addRow("Max diameter (um)", self._max_diameter)
+
+        # A segment is "boundaryClipped" (see filament.py touchesVolumeBoundary)
+        # if its own local radius reaches a face of the imaged volume anywhere
+        # along its path -- this also catches vessels that run roughly
+        # parallel/close to the crop edge and get their cross-section
+        # partially clipped along their length, not just ones that terminate
+        # there. Off by default: hiding these changes what's shown, not the
+        # underlying stats/export, so it stays a deliberate opt-in.
+        self._hide_boundary_clipped = QCheckBox("Hide boundary-clipped segments")
+        self._hide_boundary_clipped.stateChanged.connect(self._apply_filters)
+        filter_layout.addRow(self._hide_boundary_clipped)
 
         outer.addWidget(filter_box)
 
@@ -521,6 +579,21 @@ class MorphometricsWidget(QWidget):
                 scale=scale,
             )
 
+        profiles = d.get("diameter_profiles")
+        has_profiles = profiles is not None and len(profiles) > 0
+        # Real skeleton coordinates for each segment's own path, ordered by
+        # pointIndex -- segmentID (the segment's own (start, end) node pair,
+        # formatted the same way in both CSVs) is globally unique, so it's a
+        # safe direct join key without also needing filamentID. Stored on
+        # self so _build_diameter_labels can place labels on the real
+        # traced path too, not just the segments layer built below.
+        self._path_by_segment = {}
+        if has_profiles:
+            for seg_id, grp in profiles.groupby("segmentID"):
+                self._path_by_segment[seg_id] = (
+                    grp.sort_values("pointIndex")[["z", "y", "x"]].to_numpy(dtype=float)
+                )
+
         seg_stats = d["segment_stats"]
         if seg_stats is not None and len(seg_stats) > 0:
             # a zero-length line (start == end) has no well-defined
@@ -528,28 +601,61 @@ class MorphometricsWidget(QWidget):
             # direction's length, so a degenerate segment can produce the
             # "invalid value encountered in divide" warning (and a
             # rendering glitch) the moment the viewer switches to 3D
-            lines, features_rows = [], []
+            lines, straight_lines, features_rows = [], [], []
             for _, row in seg_stats.iterrows():
                 if tuple(row["_start"]) == tuple(row["_end"]):
                     continue
-                lines.append([row["_start"], row["_end"]])
+                # Trace the segment's real, possibly-curved skeleton path
+                # when we have it (has_profiles) rather than a straight
+                # line directly between its endpoints -- on a tortuous
+                # vessel a straight line can cut across unrelated
+                # structure, making it visually impossible to tell which
+                # segment a given piece of skeleton actually belongs to.
+                # Falls back to the old straight-line approximation for
+                # result folders generated before *_Segment_Diameter_
+                # Profiles.csv existed.
+                path = self._path_by_segment.get(row["segmentID"])
+                lines.append(path if path is not None and len(path) >= 2 else [row["_start"], row["_end"]])
+                # Kept as a second, angle-only reference layer (see
+                # "angles" in _layers_for_key): the branch-angle arcs are
+                # deliberately computed from this same straight
+                # branch-point-to-far-endpoint direction, not the traced
+                # path above -- with real curvature in the way there's no
+                # single well-defined point along a curve to anchor an
+                # angle to, so the direct connection stays the basis for
+                # the angle itself. Showing it alongside the arcs when
+                # angles are toggled on makes clear what geometry each
+                # angle was actually measured from.
+                straight_lines.append([row["_start"], row["_end"]])
                 features_rows.append(row)
             features = pd.DataFrame(features_rows)[
                 [c for c in COLORABLE_PROPERTIES if c in seg_stats.columns]
             ].copy()
             self._segments_layer = self.viewer.add_shapes(
                 lines,
-                shape_type="line",
+                shape_type="path",
                 name=f"{d['basename']} segments",
                 features=features,
                 edge_width=3,
                 scale=scale,
             )
+            # Cached (same lockstep row order as `shown`, see
+            # _compute_shown_mask) so _apply_filters can rebuild `.data`
+            # from the full set on every filter change.
+            self._straight_lines_full = straight_lines
+            self._straight_segments_layer = self.viewer.add_shapes(
+                straight_lines,
+                shape_type="line",
+                name=f"{d['basename']} segments (straight, for angle reference)",
+                edge_color="orange",
+                edge_width=2,
+                opacity=0.6,
+                visible=False,
+                scale=scale,
+            )
             self._build_diameter_labels(seg_stats)
             self._build_angle_layers(seg_stats)
 
-        profiles = d.get("diameter_profiles")
-        has_profiles = profiles is not None and len(profiles) > 0
         self._step_size.setEnabled(has_profiles)
         self._profile_box.setTitle(
             "Precise diameter along branch"
@@ -560,12 +666,18 @@ class MorphometricsWidget(QWidget):
             self._build_precise_diameter_labels()
 
     def _build_diameter_labels(self, seg_stats: pd.DataFrame):
-        midpoints = np.array(
-            [
-                (np.array(r["_start"], dtype=float) + np.array(r["_end"], dtype=float)) / 2
-                for _, r in seg_stats.iterrows()
-            ]
-        )
+        # Midpoint along the segment's real traced path when available,
+        # not the straight start/end average -- on a tortuous segment the
+        # straight-line midpoint can sit well off the actual curved path
+        # the segments layer now draws, making the label float away from
+        # the vessel it's meant to identify.
+        def _midpoint(row):
+            path = self._path_by_segment.get(row["segmentID"])
+            if path is not None and len(path) >= 2:
+                return path[len(path) // 2]
+            return (np.array(row["_start"], dtype=float) + np.array(row["_end"], dtype=float)) / 2
+
+        midpoints = np.array([_midpoint(r) for _, r in seg_stats.iterrows()])
         labels_df = pd.DataFrame({"label": self._format_diameter_labels(seg_stats)})
         self._diameter_labels_layer = self.viewer.add_points(
             midpoints,
@@ -603,9 +715,14 @@ class MorphometricsWidget(QWidget):
     def _build_angle_layers(self, seg_stats: pd.DataFrame):
         angles = _compute_branch_angles(seg_stats)
         self._angle_segment_rows = [a["segment_rows"] for a in angles]
+        # Cached so _apply_filters can rebuild the arcs layer's `.data` from
+        # the full set every time a filter changes, rather than relying on
+        # edge_width=0 to hide filtered-out shapes -- unlike the main
+        # segments layer, that did not reliably make these arcs invisible.
+        self._angle_arc_points_full = [a["arc_points"] for a in angles]
         if not angles:
             return
-        arcs = [a["arc_points"] for a in angles]
+        arcs = self._angle_arc_points_full
         self._angle_arcs_layer = self.viewer.add_shapes(
             arcs,
             shape_type="path",
@@ -707,7 +824,15 @@ class MorphometricsWidget(QWidget):
     # ------------------------------------------------------------------
     def _layers_for_key(self, key: str) -> list:
         if key == "angles":
-            return [self._angle_arcs_layer, self._angle_labels_layer]
+            # The straight-line reference layer rides along with the angle
+            # arcs/labels rather than getting its own checkbox: it exists
+            # specifically to show what geometry each angle was measured
+            # from, so it's only meaningful while angles are visible too.
+            return [
+                self._angle_arcs_layer,
+                self._angle_labels_layer,
+                self._straight_segments_layer,
+            ]
         return [
             {
                 "segmentation": self._segmentation_layer,
@@ -740,14 +865,21 @@ class MorphometricsWidget(QWidget):
 
     def _compute_shown_mask(self, seg_stats: pd.DataFrame) -> list:
         min_len = self._min_length.value()
+        max_len = self._max_length.value()
         min_dia = self._min_diameter.value()
+        max_dia = self._max_diameter.value()
+        hide_clipped = self._hide_boundary_clipped.isChecked()
         shown = []
         for i in range(self._table.rowCount()):
             cb = self._table.cellWidget(i, 0)
             row_checked = cb.isChecked() if cb is not None else True
-            length_ok = seg_stats.iloc[i].get("length", 0) >= min_len
-            diameter_ok = seg_stats.iloc[i].get("diameter", 0) >= min_dia
-            shown.append(bool(row_checked and length_ok and diameter_ok))
+            length = seg_stats.iloc[i].get("length", 0)
+            diameter = seg_stats.iloc[i].get("diameter", 0)
+            clipped = bool(seg_stats.iloc[i].get("boundaryClipped", False))
+            length_ok = min_len <= length <= max_len
+            diameter_ok = min_dia <= diameter <= max_dia
+            boundary_ok = not (hide_clipped and clipped)
+            shown.append(bool(row_checked and length_ok and diameter_ok and boundary_ok))
         return shown
 
     def _apply_filters(self):
@@ -765,6 +897,21 @@ class MorphometricsWidget(QWidget):
             self._segments_layer.edge_width = widths
         except Exception:
             pass
+        # Same shown mask, same row order (built in the same loop in
+        # _build_layers) -- keeps the angle-reference layer in sync with
+        # whatever filtering/checkboxes are applied to the main segments.
+        # Rebuilds `.data` from the cached full set rather than toggling
+        # edge_width=0: confirmed on real use that edge_width=0 does not
+        # reliably hide these shapes the way it does for the main segments
+        # layer, leaving filtered-out straight lines visibly behind.
+        if self._straight_segments_layer is not None:
+            try:
+                visible_lines = [
+                    line for line, s in zip(self._straight_lines_full, shown) if s
+                ]
+                self._straight_segments_layer.data = visible_lines
+            except Exception:
+                pass
 
         color_by = self._color_by.currentText()
         if color_by in seg_stats.columns:
@@ -788,9 +935,13 @@ class MorphometricsWidget(QWidget):
             ]
             if self._angle_arcs_layer is not None:
                 try:
-                    self._angle_arcs_layer.edge_width = [
-                        1 if s else 0 for s in angle_shown
+                    # Same reasoning as the straight-segments layer above:
+                    # edge_width=0 did not reliably hide filtered-out arcs,
+                    # so rebuild `.data` from the cached full set instead.
+                    visible_arcs = [
+                        pts for pts, s in zip(self._angle_arc_points_full, angle_shown) if s
                     ]
+                    self._angle_arcs_layer.data = visible_arcs
                 except Exception:
                     pass
             if self._angle_labels_layer is not None:
